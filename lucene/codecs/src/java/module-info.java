@@ -16,10 +16,12 @@
  */
 
 import org.apache.lucene.codecs.bitvectors.HnswBitVectorsFormat;
+import org.apache.lucene.codecs.turboquant.TurboQuantVectorsFormat;
 
 /** Lucene codecs and postings formats */
 module org.apache.lucene.codecs {
   requires org.apache.lucene.core;
+  requires jdk.incubator.vector;
 
   exports org.apache.lucene.codecs.bitvectors;
   exports org.apache.lucene.codecs.blockterms;
@@ -27,11 +29,13 @@ module org.apache.lucene.codecs {
   exports org.apache.lucene.codecs.bloom;
   exports org.apache.lucene.codecs.memory;
   exports org.apache.lucene.codecs.simpletext;
+  exports org.apache.lucene.codecs.turboquant;
   exports org.apache.lucene.codecs.uniformsplit;
   exports org.apache.lucene.codecs.uniformsplit.sharedterms;
 
   provides org.apache.lucene.codecs.KnnVectorsFormat with
-      HnswBitVectorsFormat;
+      HnswBitVectorsFormat,
+      TurboQuantVectorsFormat;
   provides org.apache.lucene.codecs.PostingsFormat with
       org.apache.lucene.codecs.blocktreeords.BlockTreeOrdsPostingsFormat,
       org.apache.lucene.codecs.bloom.BloomFilteringPostingsFormat,

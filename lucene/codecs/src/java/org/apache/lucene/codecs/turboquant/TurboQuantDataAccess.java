@@ -14,22 +14,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package org.apache.lucene.codecs.turboquant;
 
+import java.lang.foreign.MemorySegment;
 
+/** Package-private interface for accessing quantized vector data during merge. */
+interface TurboQuantDataAccess {
+  MemorySegment getQuantizedData(String fieldName);
 
-description = 'Lucene codecs and postings formats'
+  int getNumVectors(String fieldName);
 
-dependencies {
-  moduleImplementation project(':lucene:core')
-  moduleTestImplementation project(':lucene:test-framework')
-}
-
-// TurboQuant uses Java Vector API for SIMD-accelerated scoring
-tasks.withType(JavaCompile).configureEach {
-  options.compilerArgs += ['--add-modules', 'jdk.incubator.vector']
-}
-
-// forbidden-apis can't resolve incubator vector classes; exclude SIMD scorer
-tasks.matching { it.name == 'forbiddenApisMain' }.configureEach {
-  exclude 'org/apache/lucene/codecs/turboquant/TurboQuantScorer.class'
+  int getBytesPerVec(String fieldName);
 }
