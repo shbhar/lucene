@@ -22,6 +22,7 @@ import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.lucene.codecs.CodecUtil;
+import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.KnnVectorsWriter;
 import org.apache.lucene.codecs.hnsw.FlatFieldVectorsWriter;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
@@ -148,8 +149,11 @@ final class TurboQuantFlatVectorsWriter extends FlatVectorsWriter {
     int bytesPerVec = bytesPerVec(dim);
 
     // Stream quantized vectors through a temp file to avoid heap pressure.
-    // TODO: add byte-copy path for same-codec merges (requires exposing source segment data
-    // through MergedVectorValues or iterating source readers directly with DocIDMerger).
+    // For TurboQuant source segments, byte-copy directly (lossless, fast).
+    // For other codecs, re-encode from float32.
+    // We use MergedVectorValues for correct doc ordering and liveDocs handling,
+    // but check if the underlying FloatVectorValues is our StubVectorValues
+    // to enable byte-copy.
     IndexOutput tempOut = directory.createTempOutput(
         dataOut.getName(), "tq_merge", ioContext);
     int numVecs = 0;
@@ -157,16 +161,70 @@ final class TurboQuantFlatVectorsWriter extends FlatVectorsWriter {
 
     FloatVectorValues merged = KnnVectorsWriter.MergedVectorValues.mergeFloatVectorValues(
         fieldInfo, mergeState);
-    TurboQuantEncoder encoder = new TurboQuantEncoder(dim, format.bits, format.seed);
-    var iter = merged.iterator();
-    while (iter.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
-      float[] vec = merged.vectorValue(iter.index());
-      try (Arena arena = Arena.ofConfined()) {
-        TurboQuantVector tqv = encoder.encode(arena, vec);
-        tqv.segment().asByteBuffer().get(buf, 0, bytesPerVec);
+
+    // Detect if all sources are TurboQuant by checking each reader
+    // Build a map from source reader index → StubVectorValues for byte-copy
+    TurboQuantFlatVectorsReader.StubVectorValues[] tqSources =
+        new TurboQuantFlatVectorsReader.StubVectorValues[mergeState.knnVectorsReaders.length];
+    boolean allTQ = true;
+    for (int i = 0; i < mergeState.knnVectorsReaders.length; i++) {
+      KnnVectorsReader kvr = mergeState.knnVectorsReaders[i];
+      if (kvr == null) continue;
+      FloatVectorValues fvv = kvr.getFloatVectorValues(fieldInfo.name);
+      if (fvv == null) continue;
+      if (fvv instanceof TurboQuantFlatVectorsReader.StubVectorValues stub) {
+        tqSources[i] = stub;
+      } else {
+        allTQ = false;
+        break;
       }
-      tempOut.writeBytes(buf, bytesPerVec);
-      numVecs++;
+    }
+
+    if (allTQ) {
+      // Byte-copy path: MergedVectorValues iterates in correct doc order.
+      // For each vector, we need to find which source segment it came from
+      // and copy the quantized bytes directly. Since MergedVectorValues doesn't
+      // expose the source, we iterate each source independently using docMaps.
+      // The merged doc order is determined by docMaps — we iterate all sources,
+      // map each doc to its merged docID, sort by merged docID, then write.
+      java.util.List<long[]> entries = new java.util.ArrayList<>(); // [mergedDocID, sourceIdx, sourceOrd]
+      for (int i = 0; i < mergeState.knnVectorsReaders.length; i++) {
+        if (tqSources[i] == null) continue;
+        FloatVectorValues fvv = mergeState.knnVectorsReaders[i].getFloatVectorValues(fieldInfo.name);
+        if (fvv == null) continue;
+        var it = fvv.iterator();
+        while (it.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+          int mappedDoc = mergeState.docMaps[i].get(it.docID());
+          if (mappedDoc != -1) {
+            entries.add(new long[]{mappedDoc, i, it.index()});
+          }
+        }
+      }
+      entries.sort((a, b) -> Long.compare(a[0], b[0]));
+
+      for (long[] entry : entries) {
+        int srcIdx = (int) entry[1];
+        int srcOrd = (int) entry[2];
+        MemorySegment.copy(
+            tqSources[srcIdx].quantizedData, (long) srcOrd * bytesPerVec,
+            MemorySegment.ofArray(buf), 0, bytesPerVec);
+        tempOut.writeBytes(buf, bytesPerVec);
+        numVecs++;
+      }
+      entries = null;
+    } else {
+      // Re-encode path: cross-codec merge or mixed sources
+      TurboQuantEncoder encoder = new TurboQuantEncoder(dim, format.bits, format.seed);
+      var iter = merged.iterator();
+      while (iter.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+        float[] vec = merged.vectorValue(iter.index());
+        try (Arena arena = Arena.ofConfined()) {
+          TurboQuantVector tqv = encoder.encode(arena, vec);
+          tqv.segment().asByteBuffer().get(buf, 0, bytesPerVec);
+        }
+        tempOut.writeBytes(buf, bytesPerVec);
+        numVecs++;
+      }
     }
 
     CodecUtil.writeFooter(tempOut);
