@@ -249,16 +249,11 @@ public final class TurboQuantScorer {
       float polarCos = scorePolarFloat(query.rotatedQuery, query.centroidLUT, doc, dim);
       return query.queryNorm * docNorm * polarCos;
     }
-    // 4-bit: nibble-packed SIMD path (rearrange + int8 dot product)
-    int packedLen = dim / 2;
-    int intDot =
-        scorePolarInt8Direct(
-            query.queryInt8Deinterleaved,
-            query.centroidInt8,
-            doc.segment(),
-            TurboQuantVector.PACKED_BINS_OFFSET,
-            packedLen);
-    return query.queryNorm * docNorm * intDot * query.int8InvScale;
+    // 4-bit: direct float LUT accumulation — no intermediate array
+    float polarCos = scorePolar4BitFloatDirect(
+        query.rotatedQuery, query.centroidLUT,
+        doc.segment(), TurboQuantVector.PACKED_BINS_OFFSET, dim / 2, dim);
+    return query.queryNorm * docNorm * polarCos;
   }
 
   /** Float-precision scoring path (higher accuracy, useful for low-bit rescoring). */
@@ -445,9 +440,51 @@ public final class TurboQuantScorer {
       ThreadLocal.withInitial(() -> new byte[4096]);
 
   /**
+   * 4-bit float LUT scorer — reads packed nibbles directly from MemorySegment, accumulates
+   * rotatedQuery[i] * centroidLUT[bin] in float. No intermediate array, no int8 quantization loss.
+   * The 16-entry float LUT fits in L1 cache for fast random access.
+   *
+   * <p>Optimization history (benchmarked on 5K×1024d, Graviton3 aarch64):
+   *
+   * <ol>
+   *   <li>SIMD rearrange + int8 dot (4670ms): ByteVector.rearrange expands nibbles to int8
+   *       centroid values in an intermediate byte[], then VectorUtil.dotProduct scores. Two-pass
+   *       over data and int8 quantization of the query loses precision.
+   *   <li>Fused SIMD castShape (5385ms): Attempted to fuse expand+accumulate in SIMD registers
+   *       via castShape(byte→int). Slower — castShape generates expensive cross-lane shuffles on
+   *       aarch64 (NEON has no single-instruction byte→int widening for 16 lanes).
+   *   <li>Bin accumulation (4625ms): Accumulate query values by bin (binSum[bin] += query[i]),
+   *       then 16 final multiplies. Slower — scatter-add to binSum[nibble] causes pipeline stalls
+   *       due to data-dependent array index.
+   *   <li><b>Direct float LUT + bulk read (4491ms, current):</b> Bulk MemorySegment.copy to local
+   *       byte[], then scalar loop with float LUT lookup. Simplest code, highest precision (no
+   *       int8 quantization), and fastest. The ~1.4× gap to SQ-4bit (3147ms) is inherent to
+   *       LUT-based scoring vs SQ's arithmetic scoring (subtract+multiply, fully SIMD-pipelined).
+   * </ol>
+   */
+  static float scorePolar4BitFloatDirect(
+      float[] rotatedQuery, float[] centroidLUT, MemorySegment data, long offset,
+      int packedLen, int dim) {
+    byte[] packed = BIN_BUF.get();
+    if (packed.length < packedLen) {
+      packed = new byte[packedLen];
+      BIN_BUF.set(packed);
+    }
+    MemorySegment.copy(data, offset, MemorySegment.ofArray(packed), 0, packedLen);
+    float sum = 0;
+    int di = 0;
+    for (int pi = 0; pi < packedLen; pi++) {
+      int p = packed[pi] & 0xFF;
+      sum += rotatedQuery[di++] * centroidLUT[p & 0x0F];
+      sum += rotatedQuery[di++] * centroidLUT[p >>> 4];
+    }
+    return sum;
+  }
+
+  /**
    * Hybrid int8 polar scorer for packed 4-bit bins. Phase 1: SIMD nibble expand via
-   * ByteVector.rearrange (NEON TBL) to deinterleaved centroid int8 byte[]. Phase 2: {@link
-   * VectorUtil#dotProduct(byte[], byte[])} for platform-tuned SIMD dot product.
+   * ByteVector.rearrange (NEON TBL / x86 PSHUFB) to deinterleaved centroid int8 byte[]. Phase 2:
+   * {@link VectorUtil#dotProduct(byte[], byte[])} for platform-tuned SIMD dot product.
    */
   static int scorePolarInt8Direct(
       byte[] queryInt8, byte[] centroidInt8, MemorySegment data, long offset, int packedLen) {

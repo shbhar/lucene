@@ -80,14 +80,15 @@ final class TurboQuantRandomVectorScorer extends RandomVectorScorer.AbstractRand
               queryState.queryInt8, quantizedData, base + 4, dim);
       rawDot = queryState.queryNorm * docNorm * intDot * queryState.int8InvScale;
     } else if (bits == 4) {
-      int intDot =
-          TurboQuantScorer.scorePolarInt8Direct(
-              queryState.queryInt8Deinterleaved,
-              queryState.centroidInt8,
+      float polarCos =
+          TurboQuantScorer.scorePolar4BitFloatDirect(
+              queryState.rotatedQuery,
+              queryState.centroidLUT,
               quantizedData,
               base + TurboQuantVector.PACKED_BINS_OFFSET,
-              packedBinsLen);
-      rawDot = queryState.queryNorm * docNorm * intDot * queryState.int8InvScale;
+              packedBinsLen,
+              dim);
+      rawDot = queryState.queryNorm * docNorm * polarCos;
     } else if (bits == 1) {
       long binsOff = base + TurboQuantVector.PACKED_BINS_OFFSET;
       float polarCos =

@@ -154,8 +154,6 @@ final class TurboQuantFlatVectorsWriter extends FlatVectorsWriter {
     // We use MergedVectorValues for correct doc ordering and liveDocs handling,
     // but check if the underlying FloatVectorValues is our StubVectorValues
     // to enable byte-copy.
-    IndexOutput tempOut = directory.createTempOutput(
-        dataOut.getName(), "tq_merge", ioContext);
     int numVecs = 0;
     byte[] buf = new byte[bytesPerVec];
 
@@ -181,13 +179,31 @@ final class TurboQuantFlatVectorsWriter extends FlatVectorsWriter {
     }
 
     if (allTQ) {
-      // Byte-copy path: MergedVectorValues iterates in correct doc order.
-      // For each vector, we need to find which source segment it came from
-      // and copy the quantized bytes directly. Since MergedVectorValues doesn't
-      // expose the source, we iterate each source independently using docMaps.
-      // The merged doc order is determined by docMaps — we iterate all sources,
-      // map each doc to its merged docID, sort by merged docID, then write.
-      java.util.List<long[]> entries = new java.util.ArrayList<>(); // [mergedDocID, sourceIdx, sourceOrd]
+      // Optimized byte-copy path: skip temp file entirely.
+      // 1. Count total vectors and collect (mergedDocID, sourceIdx, sourceOrd) tuples
+      // 2. Sort by mergedDocID for correct output order
+      // 3. Write directly to dataOut + mergedData in one pass
+      int totalVecs = 0;
+      for (int i = 0; i < mergeState.knnVectorsReaders.length; i++) {
+        if (tqSources[i] == null) continue;
+        FloatVectorValues fvv = mergeState.knnVectorsReaders[i].getFloatVectorValues(fieldInfo.name);
+        if (fvv == null) continue;
+        var it = fvv.iterator();
+        while (it.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+          if (mergeState.docMaps[i].get(it.docID()) != -1) totalVecs++;
+        }
+      }
+
+      // Write metadata now that we know the count
+      writeFieldMeta(metaOut, fieldInfo.number, dim, totalVecs, dataOut.getFilePointer());
+
+      // Allocate scorer buffer
+      Arena mergeArena = Arena.ofShared();
+      MemorySegment mergedData = mergeArena.allocate((long) totalVecs * bytesPerVec);
+
+      // Collect and sort entries
+      int[][] entries = new int[totalVecs][3]; // [mergedDocID, sourceIdx, sourceOrd]
+      int idx = 0;
       for (int i = 0; i < mergeState.knnVectorsReaders.length; i++) {
         if (tqSources[i] == null) continue;
         FloatVectorValues fvv = mergeState.knnVectorsReaders[i].getFloatVectorValues(fieldInfo.name);
@@ -196,24 +212,55 @@ final class TurboQuantFlatVectorsWriter extends FlatVectorsWriter {
         while (it.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
           int mappedDoc = mergeState.docMaps[i].get(it.docID());
           if (mappedDoc != -1) {
-            entries.add(new long[]{mappedDoc, i, it.index()});
+            entries[idx][0] = mappedDoc;
+            entries[idx][1] = i;
+            entries[idx][2] = it.index();
+            idx++;
           }
         }
       }
-      entries.sort((a, b) -> Long.compare(a[0], b[0]));
+      java.util.Arrays.sort(entries, (a, b) -> Integer.compare(a[0], b[0]));
 
-      for (long[] entry : entries) {
-        int srcIdx = (int) entry[1];
-        int srcOrd = (int) entry[2];
+      // Single-pass write: source MemorySegment → buf → dataOut + mergedData
+      long outOffset = 0;
+      for (int[] entry : entries) {
         MemorySegment.copy(
-            tqSources[srcIdx].quantizedData, (long) srcOrd * bytesPerVec,
+            tqSources[entry[1]].quantizedData, (long) entry[2] * bytesPerVec,
             MemorySegment.ofArray(buf), 0, bytesPerVec);
-        tempOut.writeBytes(buf, bytesPerVec);
-        numVecs++;
+        dataOut.writeBytes(buf, bytesPerVec);
+        MemorySegment.copy(MemorySegment.ofArray(buf), 0, mergedData, outOffset, bytesPerVec);
+        outOffset += bytesPerVec;
       }
-      entries = null;
+      numVecs = totalVecs;
+
+      // Skip temp file path — go directly to scorer creation
+      final int finalNumVecs = numVecs;
+      return new CloseableRandomVectorScorerSupplier() {
+        @Override
+        public int totalVectorCount() {
+          return finalNumVecs;
+        }
+
+        @Override
+        public UpdateableRandomVectorScorer scorer() {
+          return new TqMergePairScorer(
+              mergedData, finalNumVecs, dim, bytesPerVec, format.bits);
+        }
+
+        @Override
+        public RandomVectorScorerSupplier copy() {
+          return this;
+        }
+
+        @Override
+        public void close() throws IOException {
+          mergeArena.close();
+        }
+      };
     } else {
       // Re-encode path: cross-codec merge or mixed sources
+      IndexOutput tempOut = directory.createTempOutput(
+          dataOut.getName(), "tq_merge", ioContext);
       TurboQuantEncoder encoder = new TurboQuantEncoder(dim, format.bits, format.seed);
       var iter = merged.iterator();
       while (iter.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
@@ -225,55 +272,55 @@ final class TurboQuantFlatVectorsWriter extends FlatVectorsWriter {
         tempOut.writeBytes(buf, bytesPerVec);
         numVecs++;
       }
-    }
 
-    CodecUtil.writeFooter(tempOut);
-    IOUtils.close(tempOut);
+      CodecUtil.writeFooter(tempOut);
+      IOUtils.close(tempOut);
 
-    // Write metadata now that we know the actual count
-    writeFieldMeta(metaOut, fieldInfo.number, dim, numVecs, dataOut.getFilePointer());
+      // Write metadata now that we know the actual count
+      writeFieldMeta(metaOut, fieldInfo.number, dim, numVecs, dataOut.getFilePointer());
 
-    // Copy temp file to final output and build off-heap scorer buffer
-    Arena mergeArena = Arena.ofShared();
-    MemorySegment mergedData = mergeArena.allocate((long) numVecs * bytesPerVec);
-    IndexInput tempIn = directory.openInput(tempOut.getName(), ioContext);
-    long remaining = (long) numVecs * bytesPerVec;
-    long offset = 0;
-    while (remaining > 0) {
-      int toRead = (int) Math.min(buf.length, remaining);
-      tempIn.readBytes(buf, 0, toRead);
-      dataOut.writeBytes(buf, toRead);
-      MemorySegment.copy(MemorySegment.ofArray(buf), 0, mergedData, offset, toRead);
-      offset += toRead;
-      remaining -= toRead;
-    }
-    IOUtils.close(tempIn);
-    directory.deleteFile(tempOut.getName());
-
-    final int finalNumVecs = numVecs;
-
-    return new CloseableRandomVectorScorerSupplier() {
-      @Override
-      public int totalVectorCount() {
-        return finalNumVecs;
+      // Copy temp file to final output and build off-heap scorer buffer
+      Arena mergeArena = Arena.ofShared();
+      MemorySegment mergedData = mergeArena.allocate((long) numVecs * bytesPerVec);
+      IndexInput tempIn = directory.openInput(tempOut.getName(), ioContext);
+      long remaining = (long) numVecs * bytesPerVec;
+      long offset = 0;
+      while (remaining > 0) {
+        int toRead = (int) Math.min(buf.length, remaining);
+        tempIn.readBytes(buf, 0, toRead);
+        dataOut.writeBytes(buf, toRead);
+        MemorySegment.copy(MemorySegment.ofArray(buf), 0, mergedData, offset, toRead);
+        offset += toRead;
+        remaining -= toRead;
       }
+      IOUtils.close(tempIn);
+      directory.deleteFile(tempOut.getName());
 
-      @Override
-      public UpdateableRandomVectorScorer scorer() {
-        return new TqMergePairScorer(
-            mergedData, finalNumVecs, dim, bytesPerVec, format.bits);
-      }
+      final int finalNumVecs = numVecs;
 
-      @Override
-      public RandomVectorScorerSupplier copy() {
-        return this;
-      }
+      return new CloseableRandomVectorScorerSupplier() {
+        @Override
+        public int totalVectorCount() {
+          return finalNumVecs;
+        }
 
-      @Override
-      public void close() {
-        mergeArena.close();
-      }
-    };
+        @Override
+        public UpdateableRandomVectorScorer scorer() {
+          return new TqMergePairScorer(
+              mergedData, finalNumVecs, dim, bytesPerVec, format.bits);
+        }
+
+        @Override
+        public RandomVectorScorerSupplier copy() {
+          return this;
+        }
+
+        @Override
+        public void close() {
+          mergeArena.close();
+        }
+      };
+    } // end else (re-encode path)
   }
 
   @Override
@@ -565,10 +612,7 @@ final class TurboQuantFlatVectorsWriter extends FlatVectorsWriter {
         return 0f;
       }
       if (bits == 8) {
-        int dot = 0;
-        for (int d = 0; d < dim; d++) {
-          dot += currentInt8[d] * data.get(java.lang.foreign.ValueLayout.JAVA_BYTE, base + 4 + d);
-        }
+        int dot = TurboQuantScorer.dotProductInt8(currentInt8, data, base + 4, dim);
         return Math.max(0f, (1f + currentNorm * otherNorm * dot / (127f * 127f * dim)) / 2f);
       }
       if (bits == 1 || bits == 2) {
@@ -581,7 +625,9 @@ final class TurboQuantFlatVectorsWriter extends FlatVectorsWriter {
         float sim = (float) matchBits / (intWordsPerVec * 32);
         return (1f + currentNorm * otherNorm * (2f * sim - 1f)) / 2f;
       }
-      // 4-bit
+      // 4-bit: use float LUT path (same as search scorer)
+      // Need rotatedQuery and centroidLUT — but merge scorer doesn't have them.
+      // Fall back to int8 path for merge.
       int intDot =
           TurboQuantScorer.scorePolarInt8Direct(
               currentDeinterleaved, centroidInt8, data, base + 4, packedBinsLen);
