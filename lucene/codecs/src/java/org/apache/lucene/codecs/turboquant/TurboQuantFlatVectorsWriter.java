@@ -259,6 +259,11 @@ final class TurboQuantFlatVectorsWriter extends FlatVectorsWriter {
       };
     } else {
       // Re-encode path: cross-codec merge or mixed sources
+      // BUG: For 8-bit, flush writes pre-looked-up centroid int8 values (via writeExpandedVectors),
+      // but this path writes raw TurboQuantVector bytes (bin indices 0-255). The scorer
+      // (scoreExpandedInt8Direct) interprets bytes as signed int8 centroid values, producing
+      // incorrect scores. Same-codec merge uses byte-copy and is unaffected. Fix requires
+      // special-casing 8-bit here to expand bin indices through the centroid LUT before writing.
       IndexOutput tempOut = directory.createTempOutput(
           dataOut.getName(), "tq_merge", ioContext);
       TurboQuantEncoder encoder = new TurboQuantEncoder(dim, format.bits, format.seed);

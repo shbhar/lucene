@@ -47,6 +47,7 @@ final class TurboQuantFlatVectorsReader extends FlatVectorsReader implements Tur
 
   private final Map<String, FieldEntry> fieldsByName = new HashMap<>();
   private final IndexInput dataInput;
+  private final java.util.List<Arena> offHeapArenas = new java.util.ArrayList<>();
 
   TurboQuantFlatVectorsReader(SegmentReadState state, TurboQuantFlatVectorsFormat format)
       throws IOException {
@@ -101,7 +102,9 @@ final class TurboQuantFlatVectorsReader extends FlatVectorsReader implements Tur
           quantizedSegment = MemorySegment.ofArray(quantizedData);
         } else if (numVectors > 0) {
           // Too large for heap — read in chunks into off-heap MemorySegment
-          quantizedSegment = Arena.ofShared().allocate(dataSize);
+          Arena offHeap = Arena.ofShared();
+          offHeapArenas.add(offHeap);
+          quantizedSegment = offHeap.allocate(dataSize);
           IndexInput slice =
               dataInput.slice(DATA_SLICE_PREFIX + fieldNumber, dataOffset, dataSize);
           byte[] buf = new byte[1 << 20]; // 1MB chunks
@@ -139,6 +142,9 @@ final class TurboQuantFlatVectorsReader extends FlatVectorsReader implements Tur
     } finally {
       if (!success) {
         dataInput.close();
+        for (Arena arena : offHeapArenas) {
+          arena.close();
+        }
       }
     }
   }
@@ -184,6 +190,9 @@ final class TurboQuantFlatVectorsReader extends FlatVectorsReader implements Tur
   @Override
   public void close() throws IOException {
     dataInput.close();
+    for (Arena arena : offHeapArenas) {
+      arena.close();
+    }
   }
 
   @Override
@@ -340,6 +349,10 @@ final class TurboQuantFlatVectorsReader extends FlatVectorsReader implements Tur
         reusableVector[i] = centroids[binsBuf[i] & 0xFF] * sigma;
       }
       FWHT.transform(reusableVector);
+      // BUG: should be `norm` not `norm/dim`. The inverse FWHT already divides by sqrt(dim),
+      // so this extra /dim makes reconstructed vectors dim× too small. Affects cross-codec merge
+      // (re-encode path calls vectorValue()) and the fallback VectorScorer. Same-codec merge
+      // uses byte-copy and is unaffected. Fix requires verifying the full encode→decode roundtrip.
       float invDimNorm = norm / dim;
       for (int i = 0; i < dim; i++) {
         reusableVector[i] *= signs[i] * invDimNorm;
