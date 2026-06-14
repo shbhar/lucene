@@ -591,4 +591,10 @@ final class NativeVectorUtilSupport implements VectorUtilSupport {
         MemorySegment.ofArray(arr),
         arr.length);
   }
+
+  @Override
+  public void expand16(int[] arr) {
+    // No native implementation; delegate to the (Panama) vectorized fallback.
+    delegateVectorUtilSupport.expand16(arr);
+  }
 }

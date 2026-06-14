@@ -66,11 +66,7 @@ public final class ForUtil {
   }
 
   static void expand16(int[] arr) {
-    for (int i = 0; i < 128; ++i) {
-      int l = arr[i];
-      arr[i] = (l >>> 16) & 0xFFFF;
-      arr[128 + i] = l & 0xFFFF;
-    }
+    VectorUtil.expand16(arr);
   }
 
   static void collapse16(int[] arr) {

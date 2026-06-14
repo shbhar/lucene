@@ -1515,4 +1515,28 @@ final class PanamaVectorUtilSupport implements VectorUtilSupport {
       }
     }
   }
+
+  // Unlike expand8, vectorizing expand16 is only a win on aarch64. On x86 it was neutral on the
+  // 256-bit AVX2 the original author measured, which is why #15198 left it scalar, so keep the
+  // scalar loop there and only vectorize on aarch64.
+  private static final boolean EXPAND_16_VECTOR_OPTIMIZATION = Constants.OS_ARCH.equals("aarch64");
+
+  @Override
+  public void expand16(int[] arr) {
+    // BLOCK_SIZE is 256
+    if (EXPAND_16_VECTOR_OPTIMIZATION) {
+      for (int i = 0; i < 128; i += INT_SPECIES.length()) {
+        IntVector v = IntVector.fromArray(INT_SPECIES, arr, i);
+
+        v.lanewise(LSHR, 16).intoArray(arr, i);
+        v.and(0xFFFF).intoArray(arr, 128 + i);
+      }
+    } else {
+      for (int i = 0; i < 128; ++i) {
+        int l = arr[i];
+        arr[i] = (l >>> 16) & 0xFFFF;
+        arr[128 + i] = l & 0xFFFF;
+      }
+    }
+  }
 }

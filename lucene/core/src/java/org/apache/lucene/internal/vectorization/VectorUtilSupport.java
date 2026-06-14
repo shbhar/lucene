@@ -165,4 +165,12 @@ public interface VectorUtilSupport {
    * beneficial here because the block size is 256.
    */
   void expand8(int[] arr);
+
+  /**
+   * Expands a 128-element integer array into a 256-element array by extracting individual 16-bit
+   * halves. Each 32-bit integer is split into 2 shorts, expanding the array from 128 to 256
+   * elements. Only works on arrays with exactly 256 items (128 integers expanded to 256 shorts).
+   * Vectorization is beneficial here because the block size is 256.
+   */
+  void expand16(int[] arr);
 }

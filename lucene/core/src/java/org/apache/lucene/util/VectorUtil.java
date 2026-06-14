@@ -544,4 +544,14 @@ public final class VectorUtil {
   public static void expand8(int[] arr) {
     IMPL.expand8(arr);
   }
+
+  /**
+   * Expands 128 integers in-place into a 256-element array by extracting individual 16-bit halves.
+   * Each 32-bit integer is split into 2 shorts. Only works on arrays with 256 length.
+   *
+   * @param arr the array to expand in-place
+   */
+  public static void expand16(int[] arr) {
+    IMPL.expand16(arr);
+  }
 }

@@ -374,6 +374,28 @@ public class TestVectorUtilSupport extends BaseVectorizationTestCase {
                 outputs.getFirst(), alpha, min, newScale, newAlpha, newMin, newMax));
   }
 
+  public void testExpand8() {
+    int[] expected = new int[256];
+    int[] actual = new int[256];
+    for (int i = 0; i < 256; ++i) {
+      expected[i] = actual[i] = random().nextInt();
+    }
+    LUCENE_PROVIDER.getVectorUtilSupport().expand8(expected);
+    PANAMA_OR_NATIVE_PROVIDER.getVectorUtilSupport().expand8(actual);
+    assertArrayEquals(expected, actual);
+  }
+
+  public void testExpand16() {
+    int[] expected = new int[256];
+    int[] actual = new int[256];
+    for (int i = 0; i < 256; ++i) {
+      expected[i] = actual[i] = random().nextInt();
+    }
+    LUCENE_PROVIDER.getVectorUtilSupport().expand16(expected);
+    PANAMA_OR_NATIVE_PROVIDER.getVectorUtilSupport().expand16(actual);
+    assertArrayEquals(expected, actual);
+  }
+
   private void assertFloatReturningProviders(ToDoubleFunction<VectorUtilSupport> func) {
     double luceneProviderResults = func.applyAsDouble(LUCENE_PROVIDER.getVectorUtilSupport());
     double panamaProviderResults =

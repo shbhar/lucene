@@ -463,4 +463,14 @@ final class DefaultVectorUtilSupport implements VectorUtilSupport {
       arr[192 + i] = l & 0xFF;
     }
   }
+
+  @Override
+  public void expand16(int[] arr) {
+    // BLOCK_SIZE is 256
+    for (int i = 0; i < 128; ++i) {
+      int l = arr[i];
+      arr[i] = (l >>> 16) & 0xFFFF;
+      arr[128 + i] = l & 0xFFFF;
+    }
+  }
 }

@@ -155,6 +155,9 @@ Optimizations
   TwoPhaseIterator#docIDRunEnd for two-phase excluded clauses (e.g. a doc-values
   not-equals filter), instead of advancing one doc at a time. (Jim Ferenczi)
 
+* GITHUB#XXXXX: Vectorize ForUtil.expand16 on aarch64, mirroring the expand8 work in GITHUB#15198
+  which left expand16 scalar because it was neutral on the AVX2 it was measured on. (Shitij Bhargava)
+
 * GITHUB#16254: Enable the vectorized findNextGEQ path on aarch64, where it was disabled on cores
   with fewer than 8 int lanes (Graviton2 and Graviton4). The vector compare beats the scalar
   fallback by +75% on Graviton4 and +35% on Graviton2 (AdvanceBenchmark). (Shitij Bhargava)
